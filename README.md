@@ -52,6 +52,62 @@ For a focused stage-0/1 timing run:
 microserve-bench --batch-size 4 --prompt-tokens 128 --new-tokens 32
 ```
 
+That default is deliberately a randomly initialized 5.8M-parameter teaching
+model. The CLI labels it `random toy weights (no model download)` so mechanism
+timings cannot be mistaken for useful-model inference.
+
+## Run a real model
+
+The built-in small default is
+[`HuggingFaceTB/SmolLM2-135M`](https://huggingface.co/HuggingFaceTB/SmolLM2-135M):
+a 134.5M-parameter Llama model whose required files occupy about 259 MiB.
+
+```bash
+# Fetch weights and tokenizer into the standard Hugging Face cache.
+microserve-fetch HuggingFaceTB/SmolLM2-135M
+
+# Generate text through microServe's own model and KV cache.
+microserve-generate "The capital of France is" --device mps --new-tokens 32
+
+# Benchmark those same real weights. Skip naive recomputation for larger runs.
+microserve-bench \
+  --model HuggingFaceTB/SmolLM2-135M \
+  --prompt "The capital of France is" \
+  --methods kv_cache \
+  --batch-size 4 \
+  --new-tokens 32
+```
+
+The Hub client supplies download/cache management, `tokenizers` supplies text
+encoding, and `safetensors` supplies safe tensor reads. The actual model forward
+pass, RoPE, GQA, KV cache, and generation loop remain this repository's PyTorch
+implementation; no Transformers model is constructed.
+
+The loader currently accepts standard Llama safetensors, including sharded
+checkpoints, with SwiGLU, bias-free attention/MLP, ordinary RoPE, and optional
+tied embeddings. Unsupported architectures or RoPE scaling fail explicitly.
+
+Use `--cache-dir`, `--revision`, and `--offline` to control model resolution.
+`--dtype auto` selects FP16 on MPS, BF16/FP16 on CUDA, and FP32 on CPU.
+
+## CLI memory and progress
+
+Before constructing a model or allocating KV state, both benchmark and
+generation commands show:
+
+- model provenance, parameter count, device, and dtype;
+- model, KV-cache, attention, activation, and MPS allocator-churn estimates;
+- estimated peak versus a configurable safe fraction of available memory;
+- a refusal with concrete smaller-run suggestions when the estimate is unsafe.
+
+The benchmark can isolate a mechanism with `--methods naive` or
+`--methods kv_cache`. `--force` bypasses preflight but does not make an unsafe
+allocation safe. Backend OOMs are caught, unused device memory is released, and
+the raw traceback is replaced with an actionable error panel.
+
+Long generation loops show token progress and estimated remaining time. Use
+`--no-progress` when collecting timings where even small UI overhead matters.
+
 ## The nine stages
 
 ### 0. Naive generation
@@ -187,6 +243,10 @@ src/microserve/
     speculative.py    draft, verify, accept, and rollback
     disagg.py         prefill/transfer/decode cost simulator
     router.py         queue-only and predictive SLO routing
+    checkpoint.py     Hub download and Llama safetensors weight mapping
+    memory.py         preflight estimates and device cleanup
+    cli_ui.py         shared Rich panels, tables, and error presentation
+    infer.py          real-model text generation CLI
     benchmark.py      focused wall-clock benchmark
     scorecard.py      complete shared-workload evaluation
 tests/

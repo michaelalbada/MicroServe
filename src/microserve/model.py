@@ -111,9 +111,17 @@ class Attention(nn.Module):
         v = v.repeat_interleave(groups, dim=2)
         q, k, v = (tensor.transpose(1, 2) for tensor in (q, k, v))
 
-        key_positions = torch.arange(k.size(2), device=x.device)
-        causal = key_positions[None, :] <= positions[:, None]
-        attended = F.scaled_dot_product_attention(q, k, v, attn_mask=causal)
+        if start_pos == 0:
+            # This enables a fused/memory-efficient causal kernel when the
+            # backend provides one, avoiding a materialized score mask.
+            attended = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        elif tokens == 1:
+            # A decode query sits after every cached key, so all keys are valid.
+            attended = F.scaled_dot_product_attention(q, k, v)
+        else:
+            key_positions = torch.arange(k.size(2), device=x.device)
+            causal = key_positions[None, :] <= positions[:, None]
+            attended = F.scaled_dot_product_attention(q, k, v, attn_mask=causal)
         attended = attended.transpose(1, 2).contiguous().view(batch, tokens, config.dim)
         return self.out_proj(attended)
 
@@ -230,7 +238,11 @@ class Transformer(nn.Module):
         )
 
     def forward(
-        self, token_ids: torch.Tensor, *, cache: Cache | None = None
+        self,
+        token_ids: torch.Tensor,
+        *,
+        cache: Cache | None = None,
+        last_token_only: bool = False,
     ) -> torch.Tensor:
         if token_ids.ndim != 2:
             raise ValueError("token_ids must have shape [batch, tokens]")
@@ -252,6 +264,8 @@ class Transformer(nn.Module):
             x = layer(x, start_pos=start_pos, cache=cache)
         if cache is not None:
             cache.advance(token_ids.size(1))
+        if last_token_only:
+            x = x[:, -1:]
         return self.lm_head(self.norm(x))
 
     def decode_batch(

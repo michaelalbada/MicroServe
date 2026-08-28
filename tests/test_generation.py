@@ -46,3 +46,30 @@ def test_zero_new_tokens_returns_prompt() -> None:
 
     assert generate_naive(model, prompt, max_new_tokens=0) is prompt
     assert generate_cached(model, prompt, max_new_tokens=0) is prompt
+
+
+def test_progress_and_eos_stop_generation_early() -> None:
+    model = tiny_model()
+    prompt = torch.tensor([[1, 2, 3]])
+    eos = int(model(prompt, last_token_only=True)[0, -1].argmax())
+    naive_progress = []
+    cached_progress = []
+
+    naive = generate_naive(
+        model,
+        prompt,
+        max_new_tokens=5,
+        eos_token_id=eos,
+        progress=naive_progress.append,
+    )
+    cached = generate_cached(
+        model,
+        prompt,
+        max_new_tokens=5,
+        eos_token_id=eos,
+        progress=cached_progress.append,
+    )
+
+    torch.testing.assert_close(cached, naive)
+    assert naive.size(1) == prompt.size(1) + 1
+    assert naive_progress == cached_progress == [1]

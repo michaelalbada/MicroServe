@@ -217,7 +217,7 @@ class ContinuousBatcher:
             start = state.prompt_offset
             end = start + item.tokens
             chunk = state.request.prompt[start:end][None, :]
-            logits = self.model(chunk, cache=state.cache)
+            logits = self.model(chunk, cache=state.cache, last_token_only=True)
             state.prompt_offset = end
             if state.prompt_remaining == 0:
                 self.prefilling.remove(state)

@@ -2,6 +2,13 @@
 
 from microserve.allocator import BlockAllocator, OutOfBlocksError, PagedKVCache
 from microserve.batcher import ContinuousBatcher, Request, RequestResult
+from microserve.checkpoint import (
+    DEFAULT_MODEL,
+    LoadedCheckpoint,
+    TextTokenizer,
+    fetch_snapshot,
+    load_checkpoint,
+)
 from microserve.disagg import (
     DisaggregatedResult,
     DisaggregatedSimulator,
@@ -28,11 +35,13 @@ __all__ = [
     "BlockAllocator",
     "Cache",
     "ContinuousBatcher",
+    "DEFAULT_MODEL",
     "DisaggregatedResult",
     "DisaggregatedSimulator",
     "FCFSScheduler",
     "KVCache",
     "LatencySummary",
+    "LoadedCheckpoint",
     "ModelConfig",
     "OutOfBlocksError",
     "PagedKVCache",
@@ -46,11 +55,14 @@ __all__ = [
     "SLOAwareScheduler",
     "SLOAwareRouter",
     "SpeculativeResult",
+    "TextTokenizer",
     "Transformer",
     "WorkerSpec",
     "WorkloadRequest",
     "generate_cached",
     "generate_naive",
     "generate_speculative",
+    "fetch_snapshot",
+    "load_checkpoint",
     "summarize",
 ]
