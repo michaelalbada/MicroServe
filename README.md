@@ -20,7 +20,21 @@ Python 3.10+ and PyTorch 2.2+ are required.
 ```bash
 python -m pip install -e '.[dev]'
 pytest
-microserve-scorecard
+microserve quickstart
+```
+
+`microserve quickstart` is network-free and takes only a few seconds. It sweeps
+three prompt lengths through naive and KV-cached generation, verifies identical
+tokens, and shows how the cache advantage grows with reusable context.
+
+The unified command surface is:
+
+```text
+microserve quickstart   # fast first experiment; no download
+microserve generate     # fetch/use a real model and complete text
+microserve bench        # controlled naive/KV timing experiments
+microserve scorecard    # stages 0–8 curriculum evaluation
+microserve fetch        # explicitly populate the model cache
 ```
 
 The scorecard runs one model and request shape through the whole progression:
@@ -49,7 +63,7 @@ of the scheduling tradeoffs.
 For a focused stage-0/1 timing run:
 
 ```bash
-microserve-bench --batch-size 4 --prompt-tokens 128 --new-tokens 32
+microserve bench --batch-size 4 --prompt-tokens 128 --new-tokens 32
 ```
 
 That default is deliberately a randomly initialized 5.8M-parameter teaching
@@ -64,13 +78,13 @@ a 134.5M-parameter Llama model whose required files occupy about 259 MiB.
 
 ```bash
 # Fetch weights and tokenizer into the standard Hugging Face cache.
-microserve-fetch HuggingFaceTB/SmolLM2-135M
+microserve fetch HuggingFaceTB/SmolLM2-135M
 
 # Generate text through microServe's own model and KV cache.
-microserve-generate "The capital of France is" --device mps --new-tokens 32
+microserve generate "The capital of France is" --device mps --new-tokens 32
 
 # Benchmark those same real weights. Skip naive recomputation for larger runs.
-microserve-bench \
+microserve bench \
   --model HuggingFaceTB/SmolLM2-135M \
   --prompt "The capital of France is" \
   --methods kv_cache \
@@ -246,6 +260,8 @@ src/microserve/
     checkpoint.py     Hub download and Llama safetensors weight mapping
     memory.py         preflight estimates and device cleanup
     cli_ui.py         shared Rich panels, tables, and error presentation
+    cli.py            unified microserve subcommand dispatcher
+    quickstart.py     network-free KV-cache crossover experiment
     infer.py          real-model text generation CLI
     benchmark.py      focused wall-clock benchmark
     scorecard.py      complete shared-workload evaluation

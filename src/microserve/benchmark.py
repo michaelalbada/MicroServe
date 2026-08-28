@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import statistics
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -109,9 +109,9 @@ def measure(
     )
 
 
-def _parser() -> argparse.ArgumentParser:
+def _parser(*, prog: str | None = None) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Compare naive and KV-cached autoregressive generation."
+        prog=prog, description="Compare naive and KV-cached autoregressive generation."
     )
     parser.add_argument("--device", default=str(default_device()))
     parser.add_argument(
@@ -185,9 +185,9 @@ def _results_table(results: dict[str, Measurement], *, baseline: float | None) -
     return table
 
 
-def main() -> None:
-    parser = _parser()
-    args = parser.parse_args()
+def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
+    parser = _parser(prog=prog)
+    args = parser.parse_args(argv)
     _validate(args, parser)
     console = Console()
     device = torch.device(args.device)

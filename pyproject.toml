@@ -18,10 +18,7 @@ dependencies = [
 ]
 
 [project.scripts]
-microserve-bench = "microserve.benchmark:main"
-microserve-fetch = "microserve.checkpoint:main"
-microserve-generate = "microserve.infer:main"
-microserve-scorecard = "microserve.scorecard:main"
+microserve = "microserve.cli:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "ruff>=0.6"]

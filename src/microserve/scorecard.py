@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import argparse
 import math
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import torch
@@ -377,7 +379,11 @@ def run_curriculum_scorecard(
     return CurriculumScorecard(tuple(execution), system)
 
 
-def main() -> None:
+def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
+    parser = argparse.ArgumentParser(
+        prog=prog, description="Run the complete microServe curriculum scorecard."
+    )
+    parser.parse_args(argv)
     scorecard = run_curriculum_scorecard()
     print("model execution (one model, one request workload)")
     print("stage mechanism       correct  wall ms  tok/s  steps  TTFT  ITL  blocks")

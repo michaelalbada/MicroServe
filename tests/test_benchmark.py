@@ -38,7 +38,7 @@ def test_cli_shows_random_provenance_progress_ui_and_results(
     monkeypatch.setattr(
         "sys.argv",
         [
-            "microserve-bench",
+            "microserve bench",
             "--device",
             "cpu",
             "--batch-size",
@@ -69,7 +69,7 @@ def test_cli_refuses_an_unsafe_memory_plan(monkeypatch) -> None:
     monkeypatch.setattr(
         "sys.argv",
         [
-            "microserve-bench",
+            "microserve bench",
             "--device",
             "cpu",
             "--batch-size",

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Sequence
 from pathlib import Path
 
 import torch
@@ -43,9 +44,10 @@ from microserve.memory import (
 )
 
 
-def _parser() -> argparse.ArgumentParser:
+def _parser(*, prog: str | None = None) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Fetch and run a real Llama-format model with microServe."
+        prog=prog,
+        description="Fetch and run a real Llama-format model with microServe.",
     )
     parser.add_argument("prompt", help="Text to complete.")
     parser.add_argument("--model", default=DEFAULT_MODEL)
@@ -66,9 +68,9 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> None:
-    parser = _parser()
-    args = parser.parse_args()
+def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
+    parser = _parser(prog=prog)
+    args = parser.parse_args(argv)
     if args.new_tokens < 1:
         parser.error("new tokens must be positive")
     if not 0 < args.memory_fraction <= 1:

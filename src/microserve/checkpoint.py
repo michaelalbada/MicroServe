@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -293,13 +294,15 @@ def _format_bytes(value: int) -> str:
     raise AssertionError("unreachable")
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Fetch a supported real model.")
+def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
+    parser = argparse.ArgumentParser(
+        prog=prog, description="Fetch a supported real model."
+    )
     parser.add_argument("model", nargs="?", default=DEFAULT_MODEL)
     parser.add_argument("--revision")
     parser.add_argument("--cache-dir")
     parser.add_argument("--offline", action="store_true")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     console = Console()
     console.print(f"[bold]Fetching[/bold] {args.model}")
