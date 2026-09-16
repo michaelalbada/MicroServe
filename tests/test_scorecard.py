@@ -1,13 +1,43 @@
-from microserve.scorecard import run_curriculum_scorecard
+from microserve.scorecard import run_curriculum_scorecard, run_system_scorecard
+from microserve.profiler import synthetic_service_profile
 
 
-def test_complete_curriculum_uses_one_correct_model_workload() -> None:
-    scorecard = run_curriculum_scorecard()
+def scorecard():
+    return run_system_scorecard(synthetic_service_profile())
 
-    assert [stage.stage for stage in scorecard.execution] == list(range(7))
-    assert all(stage.correct for stage in scorecard.execution)
-    assert scorecard.execution[3].peak_kv_blocks is not None
-    assert scorecard.execution[4].prefix_hits == 1
-    assert scorecard.execution[6].target_calls is not None
-    assert [stage.stage for stage in scorecard.system] == [7, 8]
-    assert all(stage.summary.requests == 3 for stage in scorecard.system)
+
+def test_scorecard_compares_system_configurations_on_one_workload() -> None:
+    result = scorecard()
+
+    assert len(result.workload) == 12
+    assert len(result.configurations) == 8
+    assert result.execution == ()
+    assert result.system == result.configurations
+    assert all(item.summary.requests == 12 for item in result.configurations)
+
+
+def test_configuration_sweep_exposes_policy_and_capacity_tradeoffs() -> None:
+    results = {
+        result.configuration.name: result for result in scorecard().system
+    }
+
+    assert (
+        results["slo_policy"].summary.slo_attainment
+        > results["baseline"].summary.slo_attainment
+    )
+    assert (
+        results["decode_heavy"].summary.output_tokens_per_second
+        > results["prefill_heavy"].summary.output_tokens_per_second
+    )
+    assert (
+        results["balanced"].p95_transfer_ms
+        < results["balanced_slow_link"].p95_transfer_ms
+    )
+    assert (
+        results["scaled_fast_link"].summary.slo_attainment
+        > results["balanced"].summary.slo_attainment
+    )
+
+
+def test_old_scorecard_entry_point_remains_available() -> None:
+    assert run_curriculum_scorecard(device="mps") == scorecard()

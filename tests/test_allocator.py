@@ -7,6 +7,7 @@ from microserve import (
     ModelConfig,
     OutOfBlocksError,
     PagedKVCache,
+    PagedKVView,
     Request,
     Transformer,
     generate_naive,
@@ -105,7 +106,10 @@ def test_paged_cache_releases_blocks_after_truncation_and_close() -> None:
     pool = allocator(num_blocks=4, block_size=2)
     cache = PagedKVCache(pool, max_tokens=8)
     states = torch.zeros(1, 5, 1, 4)
-    cache.append(0, states, states, start=0)
+    view = cache.append(0, states, states, start=0)
+    assert isinstance(view, PagedKVView)
+    assert view.block_table == tuple(cache.blocks)
+    assert view.keys.data_ptr() == pool.keys[0].data_ptr()
     cache.advance(5)
     assert pool.used_blocks == 3
 

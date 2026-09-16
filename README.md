@@ -33,32 +33,46 @@ The unified command surface is:
 microserve quickstart   # fast first experiment; no download
 microserve generate     # fetch/use a real model and complete text
 microserve bench        # controlled naive/KV timing experiments
-microserve scorecard    # stages 0–8 curriculum evaluation
+microserve scorecard    # measure a real model, then project configurations
 microserve fetch        # explicitly populate the model cache
 ```
 
-The scorecard runs one model and request shape through the whole progression:
+The scorecard loads the default real model, synchronizes the selected device,
+and measures prefill and decode wall time. Those measurements determine the
+model service rates and exact KV bytes/token used by the configuration sweep:
 
 ```text
-model execution
-stage mechanism       correct  wall ms  tok/s  steps  TTFT  ITL  blocks
-    0 naive           True         ...    ...      -     -    -       -
-    1 kv_cache        True         ...    ...      -     -    -       -
-    2 continuous      True         ...    ...    ...   ...  ...       -
-    3 paged           True         ...    ...    ...   ...  ...     ...
-    4 prefix          True         ...    ...    ...   ...  ...     ...
-    5 chunked         True         ...    ...    ...   ...  ...     ...
-    6 speculative     True         ...    ...      -     -    -       -
-
-system simulation
-stage mechanism          p50 TTFT  p95 TTFT  p95 ITL  SLO%  queue  transfer
-    7 disaggregated_fcfs       ...       ...      ...   ...    ...       ...
-    8 slo_aware                ...       ...      ...   ...    ...       ...
+Measured model execution — synchronized wall time
+operation  shape               median      p95    tok/s  samples
+prefill    prompt=8               ...      ...      ...        3
+prefill    prompt=32              ...      ...      ...        3
+prefill    prompt=56              ...      ...      ...        3
+decode     batch=1 context=56     ...      ...      ...       24
+generate   prompt=56 output=8     ...      ...      ...        3
 ```
 
-Wall-clock numbers are observations on the current machine, not performance
-claims. The invariants are correctness, resource accounting, and the direction
-of the scheduling tradeoffs.
+The second table is deliberately labeled as a projection: a single device
+cannot execute a 4-prefill/4-decode deployment. It changes scheduling policy,
+replica balance, and assumed KV-transfer bandwidth while holding the workload
+fixed:
+
+```text
+configuration       policy workers link  p50 TTFT  p95 TTFT  p95 ITL  SLO%  queue  transfer  tok/s  gain
+baseline            FCFS     1P/1D   1x        ...       ...      ...   ...    ...       ...    ...   ...
+slo_policy          SLO      1P/1D   1x        ...       ...      ...   ...    ...       ...    ...   ...
+prefill_heavy       SLO      2P/1D   1x        ...       ...      ...   ...    ...       ...    ...   ...
+decode_heavy        SLO      1P/2D   1x        ...       ...      ...   ...    ...       ...    ...   ...
+balanced_slow_link  SLO      2P/2D 0.25x       ...       ...      ...   ...    ...       ...    ...   ...
+balanced            SLO      2P/2D   1x        ...       ...      ...   ...    ...       ...    ...   ...
+decode_scaled       SLO      2P/4D   1x        ...       ...      ...   ...    ...       ...    ...   ...
+scaled_fast_link    SLO      4P/4D   4x        ...       ...      ...   ...    ...       ...    ...   ...
+```
+
+The 12 requests arrive in four waves, each containing one urgent, one chat, and
+one long-context request. Prefill/decode latency and throughput in the first
+table are real measurements. Metrics in the configuration table are
+deterministic projections calibrated from those measurements; the assumed
+fabric defaults to 25 Gbit/s and is configurable with `--link-gbps`.
 
 For a focused stage-0/1 timing run:
 
@@ -83,6 +97,9 @@ microserve fetch HuggingFaceTB/SmolLM2-135M
 # Generate text through microServe's own model and KV cache.
 microserve generate "The capital of France is" --device mps --new-tokens 32
 
+# Measure this model/device, then project the serving configuration sweep.
+microserve scorecard --model HuggingFaceTB/SmolLM2-135M --device mps
+
 # Benchmark those same real weights. Skip naive recomputation for larger runs.
 microserve bench \
   --model HuggingFaceTB/SmolLM2-135M \
@@ -106,7 +123,7 @@ Use `--cache-dir`, `--revision`, and `--offline` to control model resolution.
 
 ## CLI memory and progress
 
-Before constructing a model or allocating KV state, both benchmark and
+Before constructing a model or allocating KV state, benchmark, scorecard, and
 generation commands show:
 
 - model provenance, parameter count, device, and dtype;
@@ -167,7 +184,23 @@ interval in deterministic engine steps.
 
 `BlockAllocator` owns fixed-size physical K/V blocks. Each `PagedKVCache` maps a
 request's logical positions through its block table, so growth no longer needs a
-maximum-length contiguous reservation.
+maximum-length contiguous reservation. `paged_attention()` consumes that block
+table directly: it visits physical pages in logical order and combines them
+with an online softmax. It never concatenates a request's KV or pads the batch
+to its longest sequence.
+
+```python
+for logical_block, physical_block in enumerate(block_table):
+    keys = physical_keys[physical_block]
+    values = physical_values[physical_block]
+    scores = query @ keys.transpose(-1, -2)
+    output = online_softmax_update(output, scores, values)
+```
+
+This is a portable PyTorch reference kernel rather than a fused accelerator
+kernel. Its purpose is to make the PagedAttention memory access and numerics
+real and inspectable on CPU, CUDA, and MPS; an optimized kernel can implement
+the same `PagedKVView` contract later.
 
 ```text
 request logical blocks:  [0] [1] [2]
@@ -217,7 +250,7 @@ target_cache.truncate(prefix + len(accepted))
 The implementation is greedy and single-request to keep the acceptance and
 rollback rules readable. Tests cover perfect and deliberately bad drafts.
 
-### 7. Prefill/decode disaggregation
+### Prefill/decode disaggregation
 
 `DisaggregatedSimulator` separates prefill workers, a serialized KV-transfer
 link, and decode workers. Every result decomposes TTFT into:
@@ -232,7 +265,7 @@ Prefill and decode pools can have different sizes and token rates. The simulator
 is deterministic, making queueing, bandwidth, and fixed-latency assumptions
 easy to change and test.
 
-### 8. SLO-aware scheduling and routing
+### SLO-aware scheduling and routing
 
 `SLOAwareScheduler` orders live prefill and decode work by remaining TTFT or ITL
 slack. `SLOAwareRouter` predicts completion using queue availability, worker
@@ -240,8 +273,9 @@ rate, fixed cost, KV-transfer cost, and cached-prefix locality. The baseline
 router sees only queue availability, demonstrating why "shortest queue" can
 choose the slower path.
 
-The system scorecard reports P50/P95 TTFT, P95 ITL, SLO attainment, output
-throughput, queue delay, and KV-transfer delay.
+The scorecard first reports actual synchronized prefill/decode timings. It then
+reports projected P50/P95 TTFT, P95 ITL, SLO attainment, output throughput,
+queue delay, and KV-transfer delay for the virtual replica configurations.
 
 ## Repository map
 
@@ -253,6 +287,8 @@ src/microserve/
     batcher.py        request lifecycle and ragged continuous decode
     scheduler.py      FCFS/chunked and earliest-slack-first policies
     allocator.py      physical block pool and paged request caches
+    paged_attention.py indirect block-table attention with online softmax
+    profiler.py       synchronized real-model prefill/decode measurements
     prefix_cache.py   block-aligned prefix LRU
     speculative.py    draft, verify, accept, and rollback
     disagg.py         prefill/transfer/decode cost simulator
@@ -264,9 +300,9 @@ src/microserve/
     quickstart.py     network-free KV-cache crossover experiment
     infer.py          real-model text generation CLI
     benchmark.py      focused wall-clock benchmark
-    scorecard.py      complete shared-workload evaluation
+    scorecard.py      measured profile plus calibrated configuration sweep
 tests/
-    test_*.py         mechanism tests plus end-to-end curriculum test
+    test_*.py         mechanism and configuration-sweep tests
 ```
 
 ## Scope

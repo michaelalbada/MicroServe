@@ -6,9 +6,54 @@ operation explicit; paged allocation will replace the contiguous layout later.
 
 from __future__ import annotations
 
-from typing import Protocol, runtime_checkable
+from dataclasses import dataclass
+from typing import Protocol, TypeAlias, runtime_checkable
 
 import torch
+
+
+@dataclass(frozen=True)
+class PagedKVView:
+    """One layer's physical KV pages and their logical request order.
+
+    ``keys`` and ``values`` remain in allocator-owned physical storage.  The
+    block table is metadata only: paged attention follows it directly instead
+    of gathering the request into a contiguous tensor.
+    """
+
+    keys: torch.Tensor
+    values: torch.Tensor
+    block_table: tuple[int, ...]
+    length: int
+
+    def __post_init__(self) -> None:
+        if self.keys.shape != self.values.shape or self.keys.ndim != 4:
+            raise ValueError(
+                "physical pages must have shape "
+                "[blocks, block_size, kv_heads, head_dim]"
+            )
+        if self.length < 1:
+            raise ValueError("a paged KV view must contain at least one token")
+        required = (self.length + self.block_size - 1) // self.block_size
+        if len(self.block_table) != required:
+            raise ValueError("block table does not cover the logical KV length")
+        if any(block < 0 or block >= self.keys.size(0) for block in self.block_table):
+            raise ValueError("block table references a page outside physical storage")
+
+    @property
+    def block_size(self) -> int:
+        return self.keys.size(1)
+
+    @property
+    def num_kv_heads(self) -> int:
+        return self.keys.size(2)
+
+    @property
+    def head_dim(self) -> int:
+        return self.keys.size(3)
+
+
+KVView: TypeAlias = tuple[torch.Tensor, torch.Tensor] | PagedKVView
 
 
 @runtime_checkable
@@ -30,7 +75,7 @@ class Cache(Protocol):
         values: torch.Tensor,
         *,
         start: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]: ...
+    ) -> KVView: ...
 
     def advance(self, tokens: int) -> None: ...
 

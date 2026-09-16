@@ -23,7 +23,9 @@ COMMANDS = {
     "quickstart": CommandSpec("Run a fast KV-cache crossover demo.", quickstart.main),
     "generate": CommandSpec("Generate text with a real model.", infer.main),
     "bench": CommandSpec("Benchmark naive and cached generation.", benchmark.main),
-    "scorecard": CommandSpec("Run the complete serving curriculum.", scorecard.main),
+    "scorecard": CommandSpec(
+        "Measure a real model and project serving configurations.", scorecard.main
+    ),
     "fetch": CommandSpec(
         "Fetch a supported model into the local cache.", checkpoint.main
     ),

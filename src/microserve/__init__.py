@@ -18,9 +18,11 @@ from microserve.disagg import (
     summarize,
 )
 from microserve.generate import generate_cached, generate_naive
-from microserve.kv_cache import Cache, KVCache
+from microserve.kv_cache import Cache, KVCache, PagedKVView
 from microserve.model import ModelConfig, Transformer
+from microserve.paged_attention import paged_attention
 from microserve.prefix_cache import PrefixCache
+from microserve.profiler import OperationMeasurement, ServiceProfile, profile_model
 from microserve.router import (
     QueueOnlyRouter,
     ReplicaState,
@@ -44,7 +46,9 @@ __all__ = [
     "LoadedCheckpoint",
     "ModelConfig",
     "OutOfBlocksError",
+    "OperationMeasurement",
     "PagedKVCache",
+    "PagedKVView",
     "PrefixCache",
     "QueueOnlyRouter",
     "ReplicaState",
@@ -55,6 +59,7 @@ __all__ = [
     "SLOAwareScheduler",
     "SLOAwareRouter",
     "SpeculativeResult",
+    "ServiceProfile",
     "TextTokenizer",
     "Transformer",
     "WorkerSpec",
@@ -64,5 +69,7 @@ __all__ = [
     "generate_speculative",
     "fetch_snapshot",
     "load_checkpoint",
+    "paged_attention",
+    "profile_model",
     "summarize",
 ]

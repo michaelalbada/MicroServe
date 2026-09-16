@@ -6,6 +6,8 @@ import math
 
 import torch
 
+from microserve.kv_cache import PagedKVView
+
 
 class OutOfBlocksError(RuntimeError):
     """The KV pool cannot satisfy an allocation without preemption/eviction."""
@@ -120,28 +122,6 @@ class BlockAllocator:
         self.keys[layer, block, offset:end].copy_(keys[0])
         self.values[layer, block, offset:end].copy_(values[0])
 
-    def read(
-        self, *, layer: int, blocks: list[int], length: int
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if length < 0 or length > len(blocks) * self.block_size:
-            raise ValueError("length is not covered by the logical block table")
-        if length == 0:
-            shape = (1, 0, self.keys.size(3), self.keys.size(4))
-            empty = self.keys.new_empty(shape)
-            return empty, empty.clone()
-
-        pieces_k = []
-        pieces_v = []
-        remaining = length
-        for block in blocks:
-            used = min(remaining, self.block_size)
-            pieces_k.append(self.keys[layer, block, :used])
-            pieces_v.append(self.values[layer, block, :used])
-            remaining -= used
-            if remaining == 0:
-                break
-        return torch.cat(pieces_k)[None, :], torch.cat(pieces_v)[None, :]
-
     def blocks_for_tokens(self, tokens: int) -> int:
         if tokens < 0:
             raise ValueError("token count must be non-negative")
@@ -208,7 +188,7 @@ class PagedKVCache:
         values: torch.Tensor,
         *,
         start: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> PagedKVView:
         self._ensure_open()
         if keys.shape != values.shape or keys.ndim != 4 or keys.size(0) != 1:
             raise ValueError("states must have shape [1, tokens, kv_heads, head_dim]")
@@ -235,7 +215,12 @@ class PagedKVCache:
             )
             logical += count
             source_offset += count
-        return self.allocator.read(layer=layer, blocks=self.blocks, length=end)
+        return PagedKVView(
+            keys=self.allocator.keys[layer],
+            values=self.allocator.values[layer],
+            block_table=tuple(self.blocks),
+            length=end,
+        )
 
     def advance(self, tokens: int) -> None:
         self._ensure_open()

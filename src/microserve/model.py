@@ -8,7 +8,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from microserve.kv_cache import Cache, KVCache
+from microserve.kv_cache import Cache, KVCache, PagedKVView
+from microserve.paged_attention import paged_attention
 
 
 @dataclass(frozen=True)
@@ -102,7 +103,12 @@ class Attention(nn.Module):
         k = _apply_rope(k, positions, config.rope_base)
 
         if cache is not None:
-            k, v = cache.append(self.layer_id, k, v, start=start_pos)
+            view = cache.append(self.layer_id, k, v, start=start_pos)
+            if isinstance(view, PagedKVView):
+                attended = paged_attention(q, [view])
+                attended = attended.contiguous().view(batch, tokens, config.dim)
+                return self.out_proj(attended)
+            k, v = view
 
         # Expand grouped KV heads explicitly so the data movement is visible.
         # A later kernel-focused stage can use native GQA without changing policy.
@@ -141,7 +147,7 @@ class Attention(nn.Module):
         q = _apply_rope(q, positions, config.rope_base)
         k = _apply_rope(k, positions, config.rope_base)
 
-        prefixes = [
+        views = [
             cache.append(
                 self.layer_id,
                 k[row : row + 1],
@@ -150,6 +156,14 @@ class Attention(nn.Module):
             )
             for row, cache in enumerate(caches)
         ]
+        if all(isinstance(view, PagedKVView) for view in views):
+            attended = paged_attention(q, views)
+            attended = attended.contiguous().view(batch, 1, config.dim)
+            return self.out_proj(attended)
+        if any(isinstance(view, PagedKVView) for view in views):
+            raise ValueError("one physical batch cannot mix paged and contiguous KV")
+
+        prefixes = views
         lengths = [keys.size(1) for keys, _ in prefixes]
         max_length = max(lengths)
         padded_k = x.new_zeros(batch, max_length, config.num_kv_heads, config.head_dim)

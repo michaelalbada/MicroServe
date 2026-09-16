@@ -1,17 +1,33 @@
-"""Run one coherent workload across the complete microServe curriculum."""
+"""Compare serving-system configurations on one deterministic workload."""
 
 from __future__ import annotations
 
 import argparse
 import math
-import time
 from collections.abc import Sequence
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
+from rich.console import Console
+from rich.table import Table
 
-from microserve.allocator import BlockAllocator, PagedKVCache
-from microserve.batcher import ContinuousBatcher, Request
+from microserve.checkpoint import (
+    DEFAULT_MODEL,
+    fetch_snapshot,
+    load_llama_weights,
+    read_checkpoint_config,
+    resolve_dtype,
+)
+from microserve.cli_ui import (
+    default_device,
+    is_out_of_memory,
+    render_memory_plan,
+    render_memory_refusal,
+    render_oom,
+    render_run_summary,
+    validate_device,
+)
 from microserve.disagg import (
     DisaggregatedSimulator,
     LatencySummary,
@@ -19,45 +35,70 @@ from microserve.disagg import (
     WorkloadRequest,
     summarize,
 )
-from microserve.generate import generate_cached, generate_naive
-from microserve.model import ModelConfig, Transformer
-from microserve.prefix_cache import PrefixCache
-from microserve.scheduler import FCFSScheduler
-from microserve.speculative import generate_speculative
+from microserve.memory import (
+    MemoryBudgetError,
+    estimate_memory,
+    release_device_memory,
+    require_memory_budget,
+)
+from microserve.profiler import (
+    ServiceProfile,
+    profile_model,
+    synthetic_service_profile,
+)
+
+
+DEFAULT_LINK_GBPS = 25.0
 
 
 @dataclass(frozen=True)
-class ExecutionStage:
-    stage: int
+class Configuration:
+    """The topology and policy varied by one scorecard row."""
+
     name: str
-    correct: bool
-    wall_ms: float
-    output_tokens: int
-    engine_steps: int | None = None
-    mean_ttft_steps: float | None = None
-    p95_itl_steps: float | None = None
-    peak_kv_blocks: int | None = None
-    prefix_hits: int | None = None
-    target_calls: int | None = None
+    policy: str
+    prefill_workers: int
+    decode_workers: int
+    link_scale: float = 1.0
 
     @property
-    def output_tokens_per_second(self) -> float:
-        return 1_000 * self.output_tokens / self.wall_ms
+    def slo_aware(self) -> bool:
+        return self.policy == "SLO"
+
+    @property
+    def workers(self) -> str:
+        return f"{self.prefill_workers}P/{self.decode_workers}D"
 
 
 @dataclass(frozen=True)
-class SystemStage:
-    stage: int
-    name: str
+class ConfigurationResult:
+    configuration: Configuration
     summary: LatencySummary
     p95_transfer_ms: float
     p95_queue_ms: float
 
 
 @dataclass(frozen=True)
-class CurriculumScorecard:
-    execution: tuple[ExecutionStage, ...]
-    system: tuple[SystemStage, ...]
+class SystemScorecard:
+    profile: ServiceProfile
+    workload: tuple[WorkloadRequest, ...]
+    configurations: tuple[ConfigurationResult, ...]
+    link_gbps: float
+    transfer_fixed_ms: float
+
+    # Preserve the old read-only result spelling for callers while making the
+    # CLI and primary API configuration-centric.
+    @property
+    def system(self) -> tuple[ConfigurationResult, ...]:
+        return self.configurations
+
+    @property
+    def execution(self) -> tuple[()]:
+        return ()
+
+
+# Compatibility name retained for callers of the original scorecard API.
+CurriculumScorecard = SystemScorecard
 
 
 def _percentile(values: list[float], percentile: float) -> float:
@@ -67,149 +108,97 @@ def _percentile(values: list[float], percentile: float) -> float:
     return ordered[max(0, math.ceil(percentile * len(ordered)) - 1)]
 
 
-def _optional(value: int | float | None) -> str:
-    return "-" if value is None else f"{value:.1f}"
+def _workload(profile: ServiceProfile) -> tuple[WorkloadRequest, ...]:
+    """Four arrival waves, each mixing urgent, chat, and long requests."""
+    rows = (
+        ("chat_0", 8, 10, 0, 18),
+        ("long_0", 32, 14, 0, 45),
+        ("urgent_0", 4, 4, 0, 7),
+        ("chat_1", 10, 10, 4, 20),
+        ("long_1", 40, 14, 4, 50),
+        ("urgent_1", 5, 4, 4, 8),
+        ("chat_2", 12, 10, 8, 22),
+        ("long_2", 48, 14, 8, 55),
+        ("urgent_2", 6, 4, 8, 9),
+        ("chat_3", 14, 10, 12, 24),
+        ("long_3", 56, 14, 12, 60),
+        ("urgent_3", 4, 4, 12, 8),
+    )
+    # Arrival spacing and latency objectives track the measured decode latency,
+    # so the same workload remains meaningful on a laptop or accelerator.
+    time_scale = profile.decode.median_ms
+    return tuple(
+        WorkloadRequest(
+            request_id,
+            prompt_tokens,
+            output_tokens,
+            arrival_ms=arrival_ms * time_scale,
+            ttft_slo_ms=ttft_slo_ms * time_scale,
+            itl_slo_ms=profile.decode.p95_ms * 1.10,
+        )
+        for request_id, prompt_tokens, output_tokens, arrival_ms, ttft_slo_ms in rows
+    )
 
 
-def _workload(device: torch.device) -> list[Request]:
+def _configurations() -> tuple[Configuration, ...]:
+    """Vary one likely bottleneck at a time, then scale the whole system."""
+    return (
+        Configuration("baseline", "FCFS", 1, 1),
+        Configuration("slo_policy", "SLO", 1, 1),
+        Configuration("prefill_heavy", "SLO", 2, 1),
+        Configuration("decode_heavy", "SLO", 1, 2),
+        Configuration("balanced_slow_link", "SLO", 2, 2, 0.25),
+        Configuration("balanced", "SLO", 2, 2),
+        Configuration("decode_scaled", "SLO", 2, 4),
+        Configuration("scaled_fast_link", "SLO", 4, 4, 4.0),
+    )
+
+
+def _workers(
+    prefix: str,
+    count: int,
+    tokens_per_ms: float,
+    fixed_ms: float = 0.0,
+) -> list[WorkerSpec]:
     return [
-        Request(
-            "a_shared",
-            torch.tensor([1, 2, 3, 4, 5], device=device),
-            4,
-            arrival_step=0,
-            ttft_slo_steps=20,
-            itl_slo_steps=2,
-        ),
-        Request(
-            "b_urgent",
-            torch.tensor([9, 10, 11], device=device),
-            3,
-            arrival_step=0,
-            ttft_slo_steps=6,
-            itl_slo_steps=2,
-        ),
-        Request(
-            "c_shared",
-            torch.tensor([1, 2, 3, 4, 6, 7], device=device),
-            4,
-            arrival_step=2,
-            ttft_slo_steps=20,
-            itl_slo_steps=2,
-        ),
+        WorkerSpec(f"{prefix}-{index}", tokens_per_ms, fixed_ms)
+        for index in range(count)
     ]
 
 
-def _references(
-    model: Transformer, requests: list[Request]
-) -> dict[str, tuple[int, ...]]:
-    return {
-        request.request_id: tuple(
-            generate_naive(
-                model,
-                request.prompt[None],
-                max_new_tokens=request.max_new_tokens,
-            )[0, request.prompt.numel() :].tolist()
-        )
-        for request in requests
-    }
+def _bytes_per_ms(gigabits_per_second: float) -> float:
+    return gigabits_per_second * 125_000
 
 
-def _serial_stage(
-    stage: int,
-    name: str,
-    generate,
-    model: Transformer,
-    requests: list[Request],
-    references: dict[str, tuple[int, ...]],
-) -> ExecutionStage:
-    started = time.perf_counter()
-    outputs = {}
-    for request in requests:
-        tokens = generate(
-            model,
-            request.prompt[None],
-            max_new_tokens=request.max_new_tokens,
-        )
-        outputs[request.request_id] = tuple(
-            tokens[0, request.prompt.numel() :].tolist()
-        )
-    wall_ms = (time.perf_counter() - started) * 1_000
-    return ExecutionStage(
-        stage,
-        name,
-        outputs == references,
-        wall_ms,
-        sum(request.max_new_tokens for request in requests),
-    )
-
-
-def _engine_stage(
-    stage: int,
-    name: str,
-    batcher: ContinuousBatcher,
-    requests: list[Request],
-    references: dict[str, tuple[int, ...]],
+def _run_configuration(
+    configuration: Configuration,
+    workload: tuple[WorkloadRequest, ...],
+    profile: ServiceProfile,
     *,
-    allocator: BlockAllocator | None = None,
-    prefixes: PrefixCache | None = None,
-) -> ExecutionStage:
-    started = time.perf_counter()
-    results = batcher.run(requests)
-    wall_ms = (time.perf_counter() - started) * 1_000
-    correct = all(
-        results[request_id].generated == expected
-        for request_id, expected in references.items()
+    link_gbps: float,
+    transfer_fixed_ms: float,
+) -> ConfigurationResult:
+    simulator = DisaggregatedSimulator(
+        prefill_workers=_workers(
+            "prefill",
+            configuration.prefill_workers,
+            profile.prefill_tokens_per_ms,
+            profile.prefill_fixed_ms,
+        ),
+        decode_workers=_workers(
+            "decode", configuration.decode_workers, profile.decode_tokens_per_ms
+        ),
+        kv_bytes_per_token=profile.kv_bytes_per_token,
+        transfer_bandwidth_bytes_per_ms=(
+            _bytes_per_ms(link_gbps) * configuration.link_scale
+        ),
+        transfer_fixed_ms=transfer_fixed_ms,
+        slo_aware=configuration.slo_aware,
     )
-    itls = [latency for result in results.values() for latency in result.itl_steps]
-    metric = ExecutionStage(
-        stage,
-        name,
-        correct,
-        wall_ms,
-        sum(request.max_new_tokens for request in requests),
-        engine_steps=batcher.clock,
-        mean_ttft_steps=sum(result.ttft_steps for result in results.values())
-        / len(results),
-        p95_itl_steps=_percentile([float(value) for value in itls], 0.95),
-        peak_kv_blocks=allocator.peak_used_blocks if allocator is not None else None,
-        prefix_hits=prefixes.hits if prefixes is not None else None,
-    )
-    if prefixes is not None:
-        prefixes.close()
-    return metric
-
-
-def _pool(model: Transformer, *, blocks: int = 64) -> BlockAllocator:
-    parameter = next(model.parameters())
-    return BlockAllocator(
-        num_layers=model.config.num_layers,
-        num_blocks=blocks,
-        block_size=2,
-        num_kv_heads=model.config.num_kv_heads,
-        head_dim=model.config.head_dim,
-        device=parameter.device,
-        dtype=parameter.dtype,
-    )
-
-
-def _paged_factory(pool: BlockAllocator):
-    return lambda request: PagedKVCache(
-        pool, max_tokens=request.prompt.numel() + request.max_new_tokens
-    )
-
-
-def _system_stage(
-    stage: int,
-    name: str,
-    simulator: DisaggregatedSimulator,
-    workload: list[WorkloadRequest],
-) -> SystemStage:
-    results = simulator.run(workload)
-    return SystemStage(
-        stage,
-        name,
-        summarize(workload, results),
+    results = simulator.run(list(workload))
+    return ConfigurationResult(
+        configuration=configuration,
+        summary=summarize(list(workload), results),
         p95_transfer_ms=_percentile(
             [result.kv_transfer_ms for result in results.values()], 0.95
         ),
@@ -225,187 +214,223 @@ def _system_stage(
     )
 
 
-def run_curriculum_scorecard(
-    *, device: torch.device | str = "cpu"
-) -> CurriculumScorecard:
-    """Exercise every stage against one model and request shape."""
-    device = torch.device(device)
-    torch.manual_seed(42)
-    model = (
-        Transformer(
-            ModelConfig(
-                vocab_size=32,
-                dim=32,
-                num_layers=2,
-                num_heads=4,
-                num_kv_heads=1,
-                max_seq_len=32,
-            )
+def run_system_scorecard(
+    profile: ServiceProfile,
+    *,
+    link_gbps: float = 0.065536,
+    transfer_fixed_ms: float = 0.5,
+) -> SystemScorecard:
+    workload = _workload(profile)
+    configurations = tuple(
+        _run_configuration(
+            configuration,
+            workload,
+            profile,
+            link_gbps=link_gbps,
+            transfer_fixed_ms=transfer_fixed_ms,
         )
-        .eval()
-        .to(device)
+        for configuration in _configurations()
     )
-    requests = _workload(device)
-    references = _references(model, requests)
-    output_tokens = sum(request.max_new_tokens for request in requests)
+    return SystemScorecard(
+        profile,
+        workload,
+        configurations,
+        link_gbps,
+        transfer_fixed_ms,
+    )
 
-    execution = [
-        _serial_stage(0, "naive", generate_naive, model, requests, references),
-        _serial_stage(1, "kv_cache", generate_cached, model, requests, references),
+
+def run_curriculum_scorecard(*, device: object | None = None) -> SystemScorecard:
+    """Compatibility wrapper for the original public function."""
+    del device
+    return run_system_scorecard(synthetic_service_profile())
+
+
+def _link(scale: float) -> str:
+    return f"{scale:g}x"
+
+
+def _measured_table(profile: ServiceProfile) -> Table:
+    table = Table(title="Measured model execution — synchronized wall time")
+    table.add_column("operation", style="bold")
+    table.add_column("shape")
+    table.add_column("median", justify="right")
+    table.add_column("p95", justify="right")
+    table.add_column("tok/s", justify="right")
+    table.add_column("samples", justify="right")
+    for measurement in (*profile.prefill, profile.decode, profile.generation):
+        table.add_row(
+            measurement.operation,
+            measurement.shape,
+            f"{measurement.median_ms:.2f} ms",
+            f"{measurement.p95_ms:.2f} ms",
+            f"{measurement.tokens_per_second:,.1f}",
+            str(measurement.samples),
+        )
+    return table
+
+
+def _projection_table(scorecard: SystemScorecard) -> str:
+    lines = [
+        "Projected system configurations — calibrated, not executed",
+        "configuration       policy workers link  p50 TTFT  p95 TTFT  "
+        "p95 ITL  SLO%  queue  transfer  tok/s  gain",
     ]
+    baseline = scorecard.configurations[0].summary.output_tokens_per_second
+    for result in scorecard.configurations:
+        config = result.configuration
+        summary = result.summary
+        lines.append(
+            f"{config.name:<19} {config.policy:<6} {config.workers:>7} "
+            f"{_link(config.link_scale):>4} "
+            f"{summary.p50_ttft_ms:>9.2f} {summary.p95_ttft_ms:>9.2f} "
+            f"{summary.p95_itl_ms:>8.2f} {summary.slo_attainment * 100:>5.0f} "
+            f"{result.p95_queue_ms:>6.2f} {result.p95_transfer_ms:>9.2f} "
+            f"{summary.output_tokens_per_second:>6.0f} "
+            f"{summary.output_tokens_per_second / baseline:>5.2f}x"
+        )
+    return "\n".join(lines)
 
-    execution.append(
-        _engine_stage(
-            2,
-            "continuous",
-            ContinuousBatcher(model),
-            requests,
-            references,
-        )
-    )
-    pool = _pool(model)
-    execution.append(
-        _engine_stage(
-            3,
-            "paged",
-            ContinuousBatcher(model, cache_factory=_paged_factory(pool)),
-            requests,
-            references,
-            allocator=pool,
-        )
-    )
-    pool = _pool(model)
-    prefixes = PrefixCache(pool)
-    execution.append(
-        _engine_stage(
-            4,
-            "prefix",
-            ContinuousBatcher(
-                model,
-                cache_factory=_paged_factory(pool),
-                prefix_cache=prefixes,
-            ),
-            requests,
-            references,
-            allocator=pool,
-            prefixes=prefixes,
-        )
-    )
-    pool = _pool(model)
-    prefixes = PrefixCache(pool)
-    execution.append(
-        _engine_stage(
-            5,
-            "chunked",
-            ContinuousBatcher(
-                model,
-                scheduler=FCFSScheduler(
-                    max_batch_size=4,
-                    max_batch_tokens=4,
-                    prefill_chunk_size=2,
-                ),
-                cache_factory=_paged_factory(pool),
-                prefix_cache=prefixes,
-            ),
-            requests,
-            references,
-            allocator=pool,
-            prefixes=prefixes,
-        )
-    )
 
-    started = time.perf_counter()
-    speculative = [
-        generate_speculative(
-            model,
-            model,
-            request.prompt[None],
-            max_new_tokens=request.max_new_tokens,
-            draft_tokens=3,
-        )
-        for request in requests
-    ]
-    execution.append(
-        ExecutionStage(
-            6,
-            "speculative",
-            all(
-                tuple(result.tokens[0, request.prompt.numel() :].tolist())
-                == references[request.request_id]
-                for request, result in zip(requests, speculative)
-            ),
-            (time.perf_counter() - started) * 1_000,
-            output_tokens,
-            target_calls=sum(result.target_calls for result in speculative),
-        )
+def _parser(*, prog: str | None = None) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog=prog,
+        description="Measure a real model, then project serving configurations.",
     )
-
-    system_workload = [
-        WorkloadRequest(
-            request.request_id,
-            request.prompt.numel(),
-            request.max_new_tokens,
-            arrival_ms=float(request.arrival_step),
-            ttft_slo_ms=float(request.ttft_slo_steps)
-            if request.ttft_slo_steps is not None
-            else None,
-            itl_slo_ms=float(request.itl_slo_steps)
-            if request.itl_slo_steps is not None
-            else None,
-        )
-        for request in requests
-    ]
-    arguments = dict(
-        prefill_workers=[WorkerSpec("prefill-0", tokens_per_ms=2)],
-        decode_workers=[WorkerSpec("decode-0", tokens_per_ms=1)],
-        kv_bytes_per_token=512,
-        transfer_bandwidth_bytes_per_ms=512,
-        transfer_fixed_ms=0.5,
+    parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument("--revision")
+    parser.add_argument("--cache-dir", type=Path)
+    parser.add_argument("--offline", action="store_true")
+    parser.add_argument("--device", default=str(default_device()))
+    parser.add_argument(
+        "--dtype",
+        choices=("auto", "float32", "float16", "bfloat16"),
+        default="auto",
     )
-    system = (
-        _system_stage(
-            7,
-            "disaggregated_fcfs",
-            DisaggregatedSimulator(**arguments),
-            system_workload,
-        ),
-        _system_stage(
-            8,
-            "slo_aware",
-            DisaggregatedSimulator(**arguments, slo_aware=True),
-            system_workload,
-        ),
-    )
-    return CurriculumScorecard(tuple(execution), system)
+    parser.add_argument("--prompt-lengths", nargs="+", type=int, default=(8, 32, 56))
+    parser.add_argument("--decode-steps", type=int, default=8)
+    parser.add_argument("--warmup", type=int, default=1)
+    parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument("--link-gbps", type=float, default=DEFAULT_LINK_GBPS)
+    parser.add_argument("--transfer-fixed-ms", type=float, default=0.1)
+    parser.add_argument("--memory-fraction", type=float, default=0.75)
+    parser.add_argument("--force", action="store_true")
+    return parser
 
 
 def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
-    parser = argparse.ArgumentParser(
-        prog=prog, description="Run the complete microServe curriculum scorecard."
-    )
-    parser.parse_args(argv)
-    scorecard = run_curriculum_scorecard()
-    print("model execution (one model, one request workload)")
-    print("stage mechanism       correct  wall ms  tok/s  steps  TTFT  ITL  blocks")
-    for item in scorecard.execution:
-        print(
-            f"{item.stage:>5} {item.name:<15} {str(item.correct):<7} "
-            f"{item.wall_ms:>8.2f} {item.output_tokens_per_second:>6.0f} "
-            f"{_optional(item.engine_steps):>6} "
-            f"{_optional(item.mean_ttft_steps):>5} "
-            f"{_optional(item.p95_itl_steps):>4} "
-            f"{_optional(item.peak_kv_blocks):>7}"
+    parser = _parser(prog=prog)
+    args = parser.parse_args(argv)
+    if not args.prompt_lengths or min(args.prompt_lengths) < 1:
+        parser.error("prompt lengths must be positive")
+    if args.decode_steps < 1 or args.warmup < 0 or args.repeats < 1:
+        parser.error("decode steps/repeats must be positive and warmup non-negative")
+    if args.link_gbps <= 0 or args.transfer_fixed_ms < 0:
+        parser.error("link bandwidth must be positive and fixed latency non-negative")
+    if not 0 < args.memory_fraction <= 1:
+        parser.error("memory fraction must be in (0, 1]")
+
+    console = Console()
+    device = torch.device(args.device)
+    if unavailable := validate_device(device):
+        parser.error(unavailable)
+
+    try:
+        console.print(f"[bold]Resolving model[/bold] {args.model}")
+        snapshot = fetch_snapshot(
+            args.model,
+            revision=args.revision,
+            cache_dir=args.cache_dir,
+            local_files_only=args.offline,
         )
-    print("\nsystem simulation (same prompt/output/arrival shape)")
-    print("stage mechanism          p50 TTFT  p95 TTFT  p95 ITL  SLO%  queue  transfer")
-    for item in scorecard.system:
-        summary = item.summary
-        print(
-            f"{item.stage:>5} {item.name:<18} {summary.p50_ttft_ms:>8.2f} "
-            f"{summary.p95_ttft_ms:>9.2f} {summary.p95_itl_ms:>8.2f} "
-            f"{summary.slo_attainment * 100:>5.0f} "
-            f"{item.p95_queue_ms:>6.2f} {item.p95_transfer_ms:>9.2f}"
+        checkpoint = read_checkpoint_config(snapshot)
+        dtype = resolve_dtype(args.dtype, device, checkpoint.torch_dtype)
+        longest_prompt = max(args.prompt_lengths)
+        if longest_prompt + args.decode_steps > checkpoint.model.max_seq_len:
+            parser.error(
+                f"profile workload exceeds model context "
+                f"{checkpoint.model.max_seq_len}"
+            )
+        estimate = estimate_memory(
+            checkpoint.model,
+            method="kv_cache",
+            batch_size=1,
+            prompt_tokens=longest_prompt,
+            new_tokens=args.decode_steps,
+            dtype=dtype,
+            device=device,
+            memory_fraction=args.memory_fraction,
         )
+        render_run_summary(
+            console,
+            source=f"{args.model} (real safetensors)",
+            config=checkpoint.model,
+            device=device,
+            dtype=dtype,
+            batch_size=1,
+            prompt_tokens=longest_prompt,
+            new_tokens=args.decode_steps,
+        )
+        render_memory_plan(console, [estimate], forced=args.force)
+        try:
+            require_memory_budget([estimate], force=args.force)
+        except MemoryBudgetError:
+            render_memory_refusal(console)
+            raise SystemExit(2) from None
+
+        with console.status("Loading weights onto the device…"):
+            model, _ = load_llama_weights(snapshot, device=device, dtype=args.dtype)
+        with console.status("Measuring synchronized model execution…"):
+            profile = profile_model(
+                model,
+                model_id=args.model,
+                prompt_lengths=args.prompt_lengths,
+                decode_steps=args.decode_steps,
+                warmup=args.warmup,
+                repeats=args.repeats,
+            )
+        scorecard = run_system_scorecard(
+            profile,
+            link_gbps=args.link_gbps,
+            transfer_fixed_ms=args.transfer_fixed_ms,
+        )
+
+        console.print(_measured_table(profile))
+        prefill_fit = (
+            f"constant {profile.prefill_fixed_ms:.2f} ms"
+            if math.isinf(profile.prefill_tokens_per_ms)
+            else (
+                f"{profile.prefill_fixed_ms:.2f} ms + tokens / "
+                f"{profile.prefill_tokens_per_ms:.3f} tok/ms"
+            )
+        )
+        console.print(
+            f"Fitted prefill: {prefill_fit}  •  "
+            f"decode: {profile.decode.tokens_per_second:.1f} tok/s  •  "
+            f"KV: {profile.kv_bytes_per_token:,} bytes/token"
+        )
+        console.print(_projection_table(scorecard), markup=False, soft_wrap=True)
+        console.print(
+            "[dim]Measured table: actual model calls on this device. "
+            "Projection table: virtual replicas calibrated from those calls; "
+            f"network is assumed at {args.link_gbps:g} Gbit/s × link.[/dim]"
+        )
+    except SystemExit:
+        raise
+    except KeyboardInterrupt:
+        release_device_memory(device)
+        console.print("\n[yellow]Scorecard cancelled; device cache released.[/yellow]")
+        raise SystemExit(130) from None
+    except RuntimeError as error:
+        release_device_memory(device)
+        if is_out_of_memory(error):
+            render_oom(console, error)
+            raise SystemExit(2) from error
+        raise
+    except Exception as error:
+        release_device_memory(device)
+        console.print_exception(show_locals=False)
+        raise SystemExit(2) from error
 
 
 if __name__ == "__main__":
