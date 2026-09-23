@@ -94,6 +94,7 @@ class StepResult:
 
 
 CacheFactory = Callable[[Request], Cache]
+TokenCallback = Callable[[Request, int], None]
 
 
 class PrefixStore(Protocol):
@@ -114,11 +115,13 @@ class ContinuousBatcher:
         scheduler: FCFSScheduler | None = None,
         cache_factory: CacheFactory | None = None,
         prefix_cache: PrefixStore | None = None,
+        token_callback: TokenCallback | None = None,
     ) -> None:
         self.model = model
         self.scheduler = scheduler or FCFSScheduler()
         self.cache_factory = cache_factory or self._contiguous_cache
         self.prefix_cache = prefix_cache
+        self.token_callback = token_callback
         self.clock = 0
         self.pending: list[Request] = []
         self.prefilling: list[RequestState] = []
@@ -166,6 +169,8 @@ class ContinuousBatcher:
     def _emit(self, state: RequestState, token: int, at_step: int) -> bool:
         state.generated.append(token)
         state.token_steps.append(at_step)
+        if self.token_callback is not None:
+            self.token_callback(state.request, token)
         return len(state.generated) == state.request.max_new_tokens
 
     def _finish(self, state: RequestState) -> None:

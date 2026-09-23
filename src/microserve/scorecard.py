@@ -1,9 +1,12 @@
-"""Compare serving-system configurations on one deterministic workload."""
+"""Execute serving-system configurations on one deterministic workload."""
 
 from __future__ import annotations
 
 import argparse
 import math
+import statistics
+import time
+from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,6 +15,8 @@ import torch
 from rich.console import Console
 from rich.table import Table
 
+from microserve.allocator import BlockAllocator, PagedKVCache
+from microserve.batcher import ContinuousBatcher, Request
 from microserve.checkpoint import (
     DEFAULT_MODEL,
     fetch_snapshot,
@@ -28,77 +33,265 @@ from microserve.cli_ui import (
     render_run_summary,
     validate_device,
 )
-from microserve.disagg import (
-    DisaggregatedSimulator,
-    LatencySummary,
-    WorkerSpec,
-    WorkloadRequest,
-    summarize,
-)
 from microserve.memory import (
     MemoryBudgetError,
     estimate_memory,
     release_device_memory,
     require_memory_budget,
 )
-from microserve.profiler import (
-    ServiceProfile,
-    profile_model,
-    synthetic_service_profile,
+from microserve.scheduler import FCFSScheduler, SLOAwareScheduler
+
+
+@dataclass(frozen=True)
+class ExecutionConfiguration:
+    """One serving design that can be executed by this process."""
+
+    name: str
+    cache: str
+    policy: str
+    sequential: bool = False
+    chunked: bool = False
+
+
+@dataclass(frozen=True)
+class ExecutionMeasurement:
+    """Observed wall-clock metrics for one executable configuration."""
+
+    configuration: ExecutionConfiguration
+    correct: bool
+    median_wall_ms: float
+    p50_ttft_ms: float
+    p95_ttft_ms: float
+    p95_itl_ms: float
+    output_tokens_per_second: float
+    peak_blocks: int | None
+
+
+@dataclass(frozen=True)
+class _ExecutionRun:
+    wall_ms: float
+    ttft_ms: tuple[float, ...]
+    itl_ms: tuple[float, ...]
+    outputs: dict[str, tuple[int, ...]]
+    peak_blocks: int | None
+
+
+EXECUTION_CONFIGURATIONS = (
+    ExecutionConfiguration("sequential", "contiguous", "FCFS", sequential=True),
+    ExecutionConfiguration("continuous", "contiguous", "FCFS"),
+    ExecutionConfiguration("paged", "paged", "FCFS"),
+    ExecutionConfiguration("chunked", "paged", "FCFS", chunked=True),
+    ExecutionConfiguration("slo_aware", "paged", "SLO", chunked=True),
 )
 
 
-DEFAULT_LINK_GBPS = 25.0
+def _synchronize(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    elif device.type == "mps":
+        torch.mps.synchronize()
 
 
-@dataclass(frozen=True)
-class Configuration:
-    """The topology and policy varied by one scorecard row."""
-
-    name: str
-    policy: str
-    prefill_workers: int
-    decode_workers: int
-    link_scale: float = 1.0
-
-    @property
-    def slo_aware(self) -> bool:
-        return self.policy == "SLO"
-
-    @property
-    def workers(self) -> str:
-        return f"{self.prefill_workers}P/{self.decode_workers}D"
-
-
-@dataclass(frozen=True)
-class ConfigurationResult:
-    configuration: Configuration
-    summary: LatencySummary
-    p95_transfer_ms: float
-    p95_queue_ms: float
-
-
-@dataclass(frozen=True)
-class SystemScorecard:
-    profile: ServiceProfile
-    workload: tuple[WorkloadRequest, ...]
-    configurations: tuple[ConfigurationResult, ...]
-    link_gbps: float
-    transfer_fixed_ms: float
-
-    # Preserve the old read-only result spelling for callers while making the
-    # CLI and primary API configuration-centric.
-    @property
-    def system(self) -> tuple[ConfigurationResult, ...]:
-        return self.configurations
-
-    @property
-    def execution(self) -> tuple[()]:
-        return ()
+def _runtime_requests(
+    model: torch.nn.Module,
+    *,
+    prompt_lengths: Sequence[int],
+    decode_steps: int,
+) -> tuple[Request, ...]:
+    parameter = next(model.parameters())
+    generator = torch.Generator()
+    generator.manual_seed(0)
+    shortest_first = {
+        index: rank + 1
+        for rank, index in enumerate(
+            sorted(range(len(prompt_lengths)), key=lambda item: prompt_lengths[item])
+        )
+    }
+    return tuple(
+        Request(
+            request_id=f"request_{index}_prompt_{length}",
+            prompt=torch.randint(
+                model.config.vocab_size,
+                (length,),
+                generator=generator,
+            ).to(parameter.device),
+            max_new_tokens=decode_steps,
+            ttft_slo_steps=shortest_first[index],
+            itl_slo_steps=1,
+        )
+        for index, length in enumerate(prompt_lengths)
+    )
 
 
-# Compatibility name retained for callers of the original scorecard API.
-CurriculumScorecard = SystemScorecard
+def _runtime_scheduler(
+    configuration: ExecutionConfiguration,
+    requests: Sequence[Request],
+    *,
+    chunk_size: int,
+) -> FCFSScheduler:
+    max_batch_size = 1 if configuration.sequential else len(requests)
+    if configuration.chunked:
+        max_batch_tokens = max(len(requests), len(requests) * chunk_size)
+        kwargs = {"prefill_chunk_size": chunk_size}
+    else:
+        max_batch_tokens = max(
+            len(requests), sum(request.prompt.numel() for request in requests)
+        )
+        kwargs = {}
+    scheduler_type = (
+        SLOAwareScheduler if configuration.policy == "SLO" else FCFSScheduler
+    )
+    return scheduler_type(
+        max_batch_size=max_batch_size,
+        max_batch_tokens=max_batch_tokens,
+        **kwargs,
+    )
+
+
+def _run_execution_once(
+    model: torch.nn.Module,
+    requests: Sequence[Request],
+    configuration: ExecutionConfiguration,
+    *,
+    block_size: int,
+    chunk_size: int,
+) -> _ExecutionRun:
+    parameter = next(model.parameters())
+    device = parameter.device
+    allocator = None
+    cache_factory = None
+    if configuration.cache == "paged":
+        capacities = [
+            request.prompt.numel() + request.max_new_tokens for request in requests
+        ]
+        num_blocks = sum(math.ceil(capacity / block_size) for capacity in capacities)
+        allocator = BlockAllocator(
+            num_layers=model.config.num_layers,
+            num_blocks=num_blocks,
+            block_size=block_size,
+            num_kv_heads=model.config.num_kv_heads,
+            head_dim=model.config.head_dim,
+            device=device,
+            dtype=parameter.dtype,
+        )
+
+        def cache_factory(request: Request) -> PagedKVCache:
+            return PagedKVCache(
+                allocator,
+                max_tokens=request.prompt.numel() + request.max_new_tokens,
+            )
+
+    token_times: dict[str, list[float]] = defaultdict(list)
+    started = 0.0
+
+    def record_token(request: Request, token: int) -> None:
+        del token
+        token_times[request.request_id].append((time.perf_counter() - started) * 1_000)
+
+    batcher = ContinuousBatcher(
+        model,
+        scheduler=_runtime_scheduler(
+            configuration,
+            requests,
+            chunk_size=chunk_size,
+        ),
+        cache_factory=cache_factory,
+        token_callback=record_token,
+    )
+    _synchronize(device)
+    started = time.perf_counter()
+    results = batcher.run(list(requests))
+    _synchronize(device)
+    wall_ms = (time.perf_counter() - started) * 1_000
+    ttft = tuple(token_times[request.request_id][0] for request in requests)
+    itl = tuple(
+        right - left
+        for request in requests
+        for left, right in zip(
+            token_times[request.request_id], token_times[request.request_id][1:]
+        )
+    )
+    outputs = {request_id: result.generated for request_id, result in results.items()}
+    return _ExecutionRun(
+        wall_ms,
+        ttft,
+        itl,
+        outputs,
+        allocator.peak_used_blocks if allocator is not None else None,
+    )
+
+
+def measure_execution_configuration(
+    model: torch.nn.Module,
+    requests: Sequence[Request],
+    configuration: ExecutionConfiguration,
+    *,
+    reference: dict[str, tuple[int, ...]] | None,
+    warmup: int,
+    repeats: int,
+    block_size: int = 16,
+    chunk_size: int = 128,
+) -> tuple[ExecutionMeasurement, dict[str, tuple[int, ...]]]:
+    """Execute one configuration and aggregate only observed timings."""
+    runs = [
+        _run_execution_once(
+            model,
+            requests,
+            configuration,
+            block_size=block_size,
+            chunk_size=chunk_size,
+        )
+        for _ in range(warmup + repeats)
+    ][warmup:]
+    outputs = runs[-1].outputs
+    expected = outputs if reference is None else reference
+    wall_ms = statistics.median(run.wall_ms for run in runs)
+    ttft = [value for run in runs for value in run.ttft_ms]
+    itl = [value for run in runs for value in run.itl_ms]
+    output_tokens = sum(request.max_new_tokens for request in requests)
+    measurement = ExecutionMeasurement(
+        configuration=configuration,
+        correct=outputs == expected,
+        median_wall_ms=wall_ms,
+        p50_ttft_ms=_percentile(ttft, 0.50),
+        p95_ttft_ms=_percentile(ttft, 0.95),
+        p95_itl_ms=_percentile(itl, 0.95),
+        output_tokens_per_second=1_000 * output_tokens / wall_ms,
+        peak_blocks=max(
+            (run.peak_blocks for run in runs if run.peak_blocks is not None),
+            default=None,
+        ),
+    )
+    return measurement, outputs
+
+
+def _execution_table(measurements: Sequence[ExecutionMeasurement]) -> Table:
+    table = Table(title="Measured serving configurations — synchronized wall time")
+    table.add_column("configuration", style="bold")
+    table.add_column("cache")
+    table.add_column("policy")
+    table.add_column("correct", justify="center")
+    table.add_column("wall", justify="right")
+    table.add_column("p50 TTFT", justify="right")
+    table.add_column("p95 TTFT", justify="right")
+    table.add_column("p95 ITL", justify="right")
+    table.add_column("tok/s", justify="right")
+    table.add_column("blocks", justify="right")
+    for item in measurements:
+        config = item.configuration
+        table.add_row(
+            config.name,
+            config.cache,
+            config.policy,
+            str(item.correct),
+            f"{item.median_wall_ms:.2f} ms",
+            f"{item.p50_ttft_ms:.2f} ms",
+            f"{item.p95_ttft_ms:.2f} ms",
+            f"{item.p95_itl_ms:.2f} ms",
+            f"{item.output_tokens_per_second:.1f}",
+            "-" if item.peak_blocks is None else str(item.peak_blocks),
+        )
+    return table
 
 
 def _percentile(values: list[float], percentile: float) -> float:
@@ -108,194 +301,10 @@ def _percentile(values: list[float], percentile: float) -> float:
     return ordered[max(0, math.ceil(percentile * len(ordered)) - 1)]
 
 
-def _workload(profile: ServiceProfile) -> tuple[WorkloadRequest, ...]:
-    """Four arrival waves, each mixing urgent, chat, and long requests."""
-    rows = (
-        ("chat_0", 8, 10, 0, 18),
-        ("long_0", 32, 14, 0, 45),
-        ("urgent_0", 4, 4, 0, 7),
-        ("chat_1", 10, 10, 4, 20),
-        ("long_1", 40, 14, 4, 50),
-        ("urgent_1", 5, 4, 4, 8),
-        ("chat_2", 12, 10, 8, 22),
-        ("long_2", 48, 14, 8, 55),
-        ("urgent_2", 6, 4, 8, 9),
-        ("chat_3", 14, 10, 12, 24),
-        ("long_3", 56, 14, 12, 60),
-        ("urgent_3", 4, 4, 12, 8),
-    )
-    # Arrival spacing and latency objectives track the measured decode latency,
-    # so the same workload remains meaningful on a laptop or accelerator.
-    time_scale = profile.decode.median_ms
-    return tuple(
-        WorkloadRequest(
-            request_id,
-            prompt_tokens,
-            output_tokens,
-            arrival_ms=arrival_ms * time_scale,
-            ttft_slo_ms=ttft_slo_ms * time_scale,
-            itl_slo_ms=profile.decode.p95_ms * 1.10,
-        )
-        for request_id, prompt_tokens, output_tokens, arrival_ms, ttft_slo_ms in rows
-    )
-
-
-def _configurations() -> tuple[Configuration, ...]:
-    """Vary one likely bottleneck at a time, then scale the whole system."""
-    return (
-        Configuration("baseline", "FCFS", 1, 1),
-        Configuration("slo_policy", "SLO", 1, 1),
-        Configuration("prefill_heavy", "SLO", 2, 1),
-        Configuration("decode_heavy", "SLO", 1, 2),
-        Configuration("balanced_slow_link", "SLO", 2, 2, 0.25),
-        Configuration("balanced", "SLO", 2, 2),
-        Configuration("decode_scaled", "SLO", 2, 4),
-        Configuration("scaled_fast_link", "SLO", 4, 4, 4.0),
-    )
-
-
-def _workers(
-    prefix: str,
-    count: int,
-    tokens_per_ms: float,
-    fixed_ms: float = 0.0,
-) -> list[WorkerSpec]:
-    return [
-        WorkerSpec(f"{prefix}-{index}", tokens_per_ms, fixed_ms)
-        for index in range(count)
-    ]
-
-
-def _bytes_per_ms(gigabits_per_second: float) -> float:
-    return gigabits_per_second * 125_000
-
-
-def _run_configuration(
-    configuration: Configuration,
-    workload: tuple[WorkloadRequest, ...],
-    profile: ServiceProfile,
-    *,
-    link_gbps: float,
-    transfer_fixed_ms: float,
-) -> ConfigurationResult:
-    simulator = DisaggregatedSimulator(
-        prefill_workers=_workers(
-            "prefill",
-            configuration.prefill_workers,
-            profile.prefill_tokens_per_ms,
-            profile.prefill_fixed_ms,
-        ),
-        decode_workers=_workers(
-            "decode", configuration.decode_workers, profile.decode_tokens_per_ms
-        ),
-        kv_bytes_per_token=profile.kv_bytes_per_token,
-        transfer_bandwidth_bytes_per_ms=(
-            _bytes_per_ms(link_gbps) * configuration.link_scale
-        ),
-        transfer_fixed_ms=transfer_fixed_ms,
-        slo_aware=configuration.slo_aware,
-    )
-    results = simulator.run(list(workload))
-    return ConfigurationResult(
-        configuration=configuration,
-        summary=summarize(list(workload), results),
-        p95_transfer_ms=_percentile(
-            [result.kv_transfer_ms for result in results.values()], 0.95
-        ),
-        p95_queue_ms=_percentile(
-            [
-                result.prefill_queue_ms
-                + result.transfer_queue_ms
-                + result.decode_queue_ms
-                for result in results.values()
-            ],
-            0.95,
-        ),
-    )
-
-
-def run_system_scorecard(
-    profile: ServiceProfile,
-    *,
-    link_gbps: float = 0.065536,
-    transfer_fixed_ms: float = 0.5,
-) -> SystemScorecard:
-    workload = _workload(profile)
-    configurations = tuple(
-        _run_configuration(
-            configuration,
-            workload,
-            profile,
-            link_gbps=link_gbps,
-            transfer_fixed_ms=transfer_fixed_ms,
-        )
-        for configuration in _configurations()
-    )
-    return SystemScorecard(
-        profile,
-        workload,
-        configurations,
-        link_gbps,
-        transfer_fixed_ms,
-    )
-
-
-def run_curriculum_scorecard(*, device: object | None = None) -> SystemScorecard:
-    """Compatibility wrapper for the original public function."""
-    del device
-    return run_system_scorecard(synthetic_service_profile())
-
-
-def _link(scale: float) -> str:
-    return f"{scale:g}x"
-
-
-def _measured_table(profile: ServiceProfile) -> Table:
-    table = Table(title="Measured model execution — synchronized wall time")
-    table.add_column("operation", style="bold")
-    table.add_column("shape")
-    table.add_column("median", justify="right")
-    table.add_column("p95", justify="right")
-    table.add_column("tok/s", justify="right")
-    table.add_column("samples", justify="right")
-    for measurement in (*profile.prefill, profile.decode, profile.generation):
-        table.add_row(
-            measurement.operation,
-            measurement.shape,
-            f"{measurement.median_ms:.2f} ms",
-            f"{measurement.p95_ms:.2f} ms",
-            f"{measurement.tokens_per_second:,.1f}",
-            str(measurement.samples),
-        )
-    return table
-
-
-def _projection_table(scorecard: SystemScorecard) -> str:
-    lines = [
-        "Projected system configurations — calibrated, not executed",
-        "configuration       policy workers link  p50 TTFT  p95 TTFT  "
-        "p95 ITL  SLO%  queue  transfer  tok/s  gain",
-    ]
-    baseline = scorecard.configurations[0].summary.output_tokens_per_second
-    for result in scorecard.configurations:
-        config = result.configuration
-        summary = result.summary
-        lines.append(
-            f"{config.name:<19} {config.policy:<6} {config.workers:>7} "
-            f"{_link(config.link_scale):>4} "
-            f"{summary.p50_ttft_ms:>9.2f} {summary.p95_ttft_ms:>9.2f} "
-            f"{summary.p95_itl_ms:>8.2f} {summary.slo_attainment * 100:>5.0f} "
-            f"{result.p95_queue_ms:>6.2f} {result.p95_transfer_ms:>9.2f} "
-            f"{summary.output_tokens_per_second:>6.0f} "
-            f"{summary.output_tokens_per_second / baseline:>5.2f}x"
-        )
-    return "\n".join(lines)
-
-
 def _parser(*, prog: str | None = None) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=prog,
-        description="Measure a real model, then project serving configurations.",
+        description="Execute serving configurations with a real model.",
     )
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--revision")
@@ -311,8 +320,17 @@ def _parser(*, prog: str | None = None) -> argparse.ArgumentParser:
     parser.add_argument("--decode-steps", type=int, default=8)
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--repeats", type=int, default=3)
-    parser.add_argument("--link-gbps", type=float, default=DEFAULT_LINK_GBPS)
-    parser.add_argument("--transfer-fixed-ms", type=float, default=0.1)
+    parser.add_argument(
+        "--configurations",
+        nargs="+",
+        choices=tuple(config.name for config in EXECUTION_CONFIGURATIONS),
+        default=tuple(config.name for config in EXECUTION_CONFIGURATIONS),
+    )
+    parser.add_argument("--block-size", type=int, default=16)
+    parser.add_argument("--chunk-size", type=int, default=128)
+    # Accepted for compatibility with the former projection-only scorecard.
+    parser.add_argument("--link-gbps", type=float, help=argparse.SUPPRESS)
+    parser.add_argument("--transfer-fixed-ms", type=float, help=argparse.SUPPRESS)
     parser.add_argument("--memory-fraction", type=float, default=0.75)
     parser.add_argument("--force", action="store_true")
     return parser
@@ -325,8 +343,8 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
         parser.error("prompt lengths must be positive")
     if args.decode_steps < 1 or args.warmup < 0 or args.repeats < 1:
         parser.error("decode steps/repeats must be positive and warmup non-negative")
-    if args.link_gbps <= 0 or args.transfer_fixed_ms < 0:
-        parser.error("link bandwidth must be positive and fixed latency non-negative")
+    if args.block_size < 1 or args.chunk_size < 1:
+        parser.error("block size and chunk size must be positive")
     if not 0 < args.memory_fraction <= 1:
         parser.error("memory fraction must be in (0, 1]")
 
@@ -348,13 +366,12 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
         longest_prompt = max(args.prompt_lengths)
         if longest_prompt + args.decode_steps > checkpoint.model.max_seq_len:
             parser.error(
-                f"profile workload exceeds model context "
-                f"{checkpoint.model.max_seq_len}"
+                f"request workload exceeds model context {checkpoint.model.max_seq_len}"
             )
         estimate = estimate_memory(
             checkpoint.model,
             method="kv_cache",
-            batch_size=1,
+            batch_size=len(args.prompt_lengths),
             prompt_tokens=longest_prompt,
             new_tokens=args.decode_steps,
             dtype=dtype,
@@ -367,7 +384,7 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
             config=checkpoint.model,
             device=device,
             dtype=dtype,
-            batch_size=1,
+            batch_size=len(args.prompt_lengths),
             prompt_tokens=longest_prompt,
             new_tokens=args.decode_steps,
         )
@@ -380,40 +397,57 @@ def main(argv: Sequence[str] | None = None, *, prog: str | None = None) -> None:
 
         with console.status("Loading weights onto the device…"):
             model, _ = load_llama_weights(snapshot, device=device, dtype=args.dtype)
-        with console.status("Measuring synchronized model execution…"):
-            profile = profile_model(
-                model,
-                model_id=args.model,
-                prompt_lengths=args.prompt_lengths,
-                decode_steps=args.decode_steps,
-                warmup=args.warmup,
-                repeats=args.repeats,
-            )
-        scorecard = run_system_scorecard(
-            profile,
-            link_gbps=args.link_gbps,
-            transfer_fixed_ms=args.transfer_fixed_ms,
+        requests = _runtime_requests(
+            model,
+            prompt_lengths=args.prompt_lengths,
+            decode_steps=args.decode_steps,
         )
+        selected = [
+            config
+            for config in EXECUTION_CONFIGURATIONS
+            if config.name in args.configurations
+        ]
+        output_tokens_per_run = len(requests) * args.decode_steps
+        total_output_tokens = (
+            output_tokens_per_run * (args.warmup + args.repeats) * len(selected)
+        )
+        console.print(
+            f"[dim]Actual workload: {len(requests)} concurrent requests × "
+            f"{args.decode_steps} output tokens; {args.warmup + args.repeats} "
+            f"runs/configuration × {len(selected)} configurations = "
+            f"{total_output_tokens:,} generated tokens.[/dim]"
+        )
+        measurements = []
+        reference = None
+        for configuration in selected:
+            with console.status(
+                f"Executing [bold]{configuration.name}[/bold] "
+                f"({args.warmup} warmup + {args.repeats} measured)…"
+            ):
+                measurement, outputs = measure_execution_configuration(
+                    model,
+                    requests,
+                    configuration,
+                    reference=reference,
+                    warmup=args.warmup,
+                    repeats=args.repeats,
+                    block_size=args.block_size,
+                    chunk_size=args.chunk_size,
+                )
+            if reference is None:
+                reference = outputs
+            measurements.append(measurement)
+            console.print(
+                f"  [green]✓[/green] {configuration.name}: "
+                f"{measurement.median_wall_ms:.2f} ms, "
+                f"{measurement.output_tokens_per_second:.1f} tok/s"
+            )
 
-        console.print(_measured_table(profile))
-        prefill_fit = (
-            f"constant {profile.prefill_fixed_ms:.2f} ms"
-            if math.isinf(profile.prefill_tokens_per_ms)
-            else (
-                f"{profile.prefill_fixed_ms:.2f} ms + tokens / "
-                f"{profile.prefill_tokens_per_ms:.3f} tok/ms"
-            )
-        )
+        console.print(_execution_table(measurements))
         console.print(
-            f"Fitted prefill: {prefill_fit}  •  "
-            f"decode: {profile.decode.tokens_per_second:.1f} tok/s  •  "
-            f"KV: {profile.kv_bytes_per_token:,} bytes/token"
-        )
-        console.print(_projection_table(scorecard), markup=False, soft_wrap=True)
-        console.print(
-            "[dim]Measured table: actual model calls on this device. "
-            "Projection table: virtual replicas calibrated from those calls; "
-            f"network is assumed at {args.link_gbps:g} Gbit/s × link.[/dim]"
+            "[dim]Every row executed the complete workload with the loaded model. "
+            "TTFT and ITL are observed token emission times; no service-time fit, "
+            "virtual replica, or network model is used.[/dim]"
         )
     except SystemExit:
         raise

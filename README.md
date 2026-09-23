@@ -15,12 +15,13 @@ No vLLM, SGLang, TensorRT-LLM, or serving framework is used.
 
 ## Run the curriculum
 
-Python 3.10+ and PyTorch 2.2+ are required.
+Install [uv](https://docs.astral.sh/uv/), then create the locked development
+environment and run the curriculum:
 
 ```bash
-python -m pip install -e '.[dev]'
-pytest
-microserve quickstart
+uv sync
+uv run pytest
+uv run microserve quickstart
 ```
 
 `microserve quickstart` is network-free and takes only a few seconds. It sweeps
@@ -30,54 +31,37 @@ tokens, and shows how the cache advantage grows with reusable context.
 The unified command surface is:
 
 ```text
-microserve quickstart   # fast first experiment; no download
-microserve generate     # fetch/use a real model and complete text
-microserve bench        # controlled naive/KV timing experiments
-microserve scorecard    # measure a real model, then project configurations
-microserve fetch        # explicitly populate the model cache
+uv run microserve quickstart   # fast first experiment; no download
+uv run microserve generate     # fetch/use a real model and complete text
+uv run microserve bench        # controlled naive/KV timing experiments
+uv run microserve scorecard    # execute serving configurations with a real model
+uv run microserve fetch        # explicitly populate the model cache
 ```
 
 The scorecard loads the default real model, synchronizes the selected device,
-and measures prefill and decode wall time. Those measurements determine the
-model service rates and exact KV bytes/token used by the configuration sweep:
+and runs the same request workload through five executable serving designs:
 
 ```text
-Measured model execution — synchronized wall time
-operation  shape               median      p95    tok/s  samples
-prefill    prompt=8               ...      ...      ...        3
-prefill    prompt=32              ...      ...      ...        3
-prefill    prompt=56              ...      ...      ...        3
-decode     batch=1 context=56     ...      ...      ...       24
-generate   prompt=56 output=8     ...      ...      ...        3
+Measured serving configurations — synchronized wall time
+configuration  cache       policy  correct  wall  p50 TTFT  p95 TTFT  p95 ITL  tok/s  blocks
+sequential     contiguous  FCFS       True   ...       ...       ...      ...    ...       -
+continuous     contiguous  FCFS       True   ...       ...       ...      ...    ...       -
+paged          paged       FCFS       True   ...       ...       ...      ...    ...     ...
+chunked        paged       FCFS       True   ...       ...       ...      ...    ...     ...
+slo_aware      paged       SLO        True   ...       ...       ...      ...    ...     ...
 ```
 
-The second table is deliberately labeled as a projection: a single device
-cannot execute a 4-prefill/4-decode deployment. It changes scheduling policy,
-replica balance, and assumed KV-transfer bandwidth while holding the workload
-fixed:
-
-```text
-configuration       policy workers link  p50 TTFT  p95 TTFT  p95 ITL  SLO%  queue  transfer  tok/s  gain
-baseline            FCFS     1P/1D   1x        ...       ...      ...   ...    ...       ...    ...   ...
-slo_policy          SLO      1P/1D   1x        ...       ...      ...   ...    ...       ...    ...   ...
-prefill_heavy       SLO      2P/1D   1x        ...       ...      ...   ...    ...       ...    ...   ...
-decode_heavy        SLO      1P/2D   1x        ...       ...      ...   ...    ...       ...    ...   ...
-balanced_slow_link  SLO      2P/2D 0.25x       ...       ...      ...   ...    ...       ...    ...   ...
-balanced            SLO      2P/2D   1x        ...       ...      ...   ...    ...       ...    ...   ...
-decode_scaled       SLO      2P/4D   1x        ...       ...      ...   ...    ...       ...    ...   ...
-scaled_fast_link    SLO      4P/4D   4x        ...       ...      ...   ...    ...       ...    ...   ...
-```
-
-The 12 requests arrive in four waves, each containing one urgent, one chat, and
-one long-context request. Prefill/decode latency and throughput in the first
-table are real measurements. Metrics in the configuration table are
-deterministic projections calibrated from those measurements; the assumed
-fabric defaults to 25 Gbit/s and is configurable with `--link-gbps`.
+Every row performs model forward passes and records token emission timestamps.
+TTFT, ITL, wall time, throughput, correctness, and paged-block usage are all
+observed; there is no fitted service rate, virtual replica, or assumed network.
+`--prompt-lengths` creates one concurrent request per length, and
+`--decode-steps` is the output length of each request. Use `--configurations`
+to select a smaller subset for long experiments.
 
 For a focused stage-0/1 timing run:
 
 ```bash
-microserve bench --batch-size 4 --prompt-tokens 128 --new-tokens 32
+uv run microserve bench --batch-size 4 --prompt-tokens 128 --new-tokens 32
 ```
 
 That default is deliberately a randomly initialized 5.8M-parameter teaching
@@ -92,16 +76,16 @@ a 134.5M-parameter Llama model whose required files occupy about 259 MiB.
 
 ```bash
 # Fetch weights and tokenizer into the standard Hugging Face cache.
-microserve fetch HuggingFaceTB/SmolLM2-135M
+uv run microserve fetch HuggingFaceTB/SmolLM2-135M
 
 # Generate text through microServe's own model and KV cache.
-microserve generate "The capital of France is" --device mps --new-tokens 32
+uv run microserve generate "The capital of France is" --device mps --new-tokens 32
 
-# Measure this model/device, then project the serving configuration sweep.
-microserve scorecard --model HuggingFaceTB/SmolLM2-135M --device mps
+# Execute the serving configuration sweep with this model/device.
+uv run microserve scorecard --model HuggingFaceTB/SmolLM2-135M --device mps
 
 # Benchmark those same real weights. Skip naive recomputation for larger runs.
-microserve bench \
+uv run microserve bench \
   --model HuggingFaceTB/SmolLM2-135M \
   --prompt "The capital of France is" \
   --methods kv_cache \
@@ -273,9 +257,10 @@ rate, fixed cost, KV-transfer cost, and cached-prefix locality. The baseline
 router sees only queue availability, demonstrating why "shortest queue" can
 choose the slower path.
 
-The scorecard first reports actual synchronized prefill/decode timings. It then
-reports projected P50/P95 TTFT, P95 ITL, SLO attainment, output throughput,
-queue delay, and KV-transfer delay for the virtual replica configurations.
+The scorecard executes `SLOAwareScheduler` directly and reports observed TTFT,
+ITL, output throughput, and correctness. The disaggregation simulator remains
+an inspectable teaching component, but its modeled times are not presented as
+device measurements.
 
 ## Repository map
 
@@ -300,7 +285,7 @@ src/microserve/
     quickstart.py     network-free KV-cache crossover experiment
     infer.py          real-model text generation CLI
     benchmark.py      focused wall-clock benchmark
-    scorecard.py      measured profile plus calibrated configuration sweep
+    scorecard.py      real-model serving configuration measurements
 tests/
     test_*.py         mechanism and configuration-sweep tests
 ```

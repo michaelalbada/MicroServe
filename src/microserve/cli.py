@@ -24,7 +24,7 @@ COMMANDS = {
     "generate": CommandSpec("Generate text with a real model.", infer.main),
     "bench": CommandSpec("Benchmark naive and cached generation.", benchmark.main),
     "scorecard": CommandSpec(
-        "Measure a real model and project serving configurations.", scorecard.main
+        "Execute serving configurations with a real model.", scorecard.main
     ),
     "fetch": CommandSpec(
         "Fetch a supported model into the local cache.", checkpoint.main
