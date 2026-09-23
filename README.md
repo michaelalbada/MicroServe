@@ -1,4 +1,4 @@
-# microServe
+# MicroServe
 
 Modern LLM serving from first principles.
 
